@@ -240,14 +240,3 @@
 
 ---
 
-## 🧩 How We Can Learn It Step-by-Step
-
-We can make this **hands-on & progressive**:
-
-* Each phase = 1–2 weeks (with exercises)
-* I’ll give you **commands, labs, challenges, and real-world troubleshooting** examples.
-* You’ll build confidence to handle production-grade Linux.
-
----
-
-Would you like me to start **Phase 1 (Linux Foundations)** with a detailed breakdown and hands-on exercises (lab-style) — or do you want me to create a **weekly roadmap** first (8–10 weeks plan)?
