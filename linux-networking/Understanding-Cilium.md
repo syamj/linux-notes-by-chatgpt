@@ -364,5 +364,162 @@ Everything from routing to NAT to security happens **inside the kernel**.
 | **Portability**   | Works across bare-metal, cloud, and hybrid clusters       |
 
 ---
+Let’s go step-by-step and explain **how Cilium handles traffic to a Kubernetes Service IP (ClusterIP, NodePort, LoadBalancer)**, what eBPF programs are involved, and which **load-balancing algorithm** it uses.
 
+---
 
+## 🧩 1. The Context
+
+In traditional Kubernetes setups (like with kube-proxy), **iptables** rules are used to implement Service IPs and backend load balancing.
+Cilium replaces this entirely using **eBPF programs** that are attached at strategic hooks in the kernel networking stack (XDP, TC, socket layer, etc.) for **fast, programmable, in-kernel load balancing**.
+
+When a packet arrives **to a Service IP (ClusterIP, NodePort, LoadBalancer IP, etc.)**, Cilium’s eBPF datapath intercepts it before it reaches the normal IP stack and performs:
+
+* **Service lookup**
+* **Backend selection**
+* **SNAT / DNAT**
+* **Session affinity or consistent hashing (if configured)**
+* **Forwarding to backend pod**
+
+---
+
+## ⚙️ 2. The eBPF Programs Involved
+
+Cilium attaches several eBPF programs to kernel hooks:
+
+| Hook                    | Purpose                                                    |
+| ----------------------- | ---------------------------------------------------------- |
+| `tc ingress/egress`     | Main datapath for packets from Pods and to Pods            |
+| `XDP`                   | Optional — for very early packet filtering or acceleration |
+| `socket` (cgroup hooks) | For local process-based LB and visibility                  |
+| `host firewall`         | For traffic between node and pods or between nodes         |
+
+The **service load-balancing logic** lives mainly in the **`bpf_lxc.c`** (for pod traffic) and **`bpf_host.c`** (for host traffic) eBPF programs, and uses maps like:
+
+* `cilium_lb4_services_v2` (service lookup)
+* `cilium_lb4_backends` (backends)
+* `cilium_lb4_reverse_nat` (reverse NAT)
+* `cilium_ct4_global` (connection tracking)
+
+---
+
+## 📡 3. Step-by-Step: Packet Path (Pod → Service → Remote Pod)
+
+Let’s assume:
+
+* **Pod A** (10.0.1.10 on Node1) connects to **Service IP 10.96.0.5:80**
+* Service **`web-svc`** has two backends:
+
+  * **Pod B** (10.0.2.5 on Node2)
+  * **Pod C** (10.0.1.15 on Node1)
+
+---
+
+### Step 1️⃣: Packet Leaves Pod A
+
+* Pod A sends packet to destination **10.96.0.5:80** (ClusterIP).
+* The packet hits the **veth pair** connected to Cilium (vethX <-> cilium_host).
+* On **veth ingress**, the Cilium **TC eBPF program** executes (`bpf_lxc.c`).
+
+---
+
+### Step 2️⃣: Service Lookup in eBPF Maps
+
+* eBPF looks up the destination IP (10.96.0.5) in the **`cilium_lb4_services_v2`** map.
+* Finds the Service entry and its backend set.
+* Applies **load-balancing algorithm** to pick one backend:
+
+  * **Default:** *Random with probability weighting* (essentially pseudo-random hash)
+  * If **sessionAffinity** or **Maglev consistent hashing** is configured, that’s applied instead.
+
+---
+
+### Step 3️⃣: Load-Balancing Algorithm
+
+Cilium supports several backend selection modes:
+
+| Mode                               | Description                                                                                 |
+| ---------------------------------- | ------------------------------------------------------------------------------------------- |
+| **Random (default)**               | Uses a simple random choice weighted by backend weight                                      |
+| **Maglev Consistent Hashing**      | Provides stable backend selection across node restarts (for L7 proxies, session stickiness) |
+| **Session Affinity**               | Uses source IP hash to select backend and keeps same backend for that client                |
+| **Least-Connection / Round Robin** | (optional in L7 layer via Envoy proxy, not L4 datapath)                                     |
+
+**By default at L4 (eBPF datapath level):**
+
+> 🔹 Cilium uses *random selection with equal weights* (implemented via `cilium_lb4_backends` array lookup and hashing).
+> 🔹 Maglev can be enabled via `--bpf-lb-algorithm=maglev`.
+
+---
+
+### Step 4️⃣: DNAT (Destination NAT)
+
+* Once the backend (say Pod B) is selected, the eBPF program rewrites:
+
+  * **Destination IP:** 10.96.0.5 → 10.0.2.5
+  * **Destination Port:** 80 → Pod B’s target port
+* A **reverse NAT entry** is created in the `cilium_lb4_reverse_nat` map, so response packets can be reversed later.
+
+---
+
+### Step 5️⃣: Routing to Remote Node
+
+* The eBPF datapath determines Pod B (10.0.2.5) is on **Node2**.
+* It looks up the **encapsulation mode**:
+
+  * **VXLAN or Geneve** (overlay)
+  * or **direct routing / native routing** (depending on Cilium config)
+* The packet is encapsulated with outer headers and sent over the **node-to-node tunnel** (if overlay mode) or routed via direct route.
+
+---
+
+### Step 6️⃣: Node2 Receives Packet
+
+* On Node2, the **`bpf_host`** program processes the decapsulated packet.
+* eBPF recognizes it as a **load-balanced packet** (due to metadata and reverse NAT entry).
+* It performs **reverse DNAT**:
+
+  * **Destination IP:** 10.0.2.5 → Pod B (preserved)
+  * **Source IP:** Restored to the original Pod A IP if SNAT was applied.
+
+---
+
+### Step 7️⃣: Packet Delivered to Pod B
+
+* Packet is passed through the **veth** into the Pod B’s network namespace.
+* Pod B sees a connection coming **from Pod A’s IP** or **from Node1’s IP** (depending on SNAT mode).
+
+---
+
+### Step 8️⃣: Response Path (Pod B → Pod A)
+
+* Response packet hits **TC eBPF** on Node2 → reverse NAT lookup.
+* eBPF rewrites back to **Service IP (10.96.0.5)** for connection tracking consistency.
+* Packet is routed back (possibly encapsulated) to Node1.
+* Node1’s eBPF program receives it, looks up the **CT entry**, and forwards it to Pod A.
+
+---
+
+## 🔄 4. Where eBPF Shines vs iptables
+
+| Feature             | iptables                   | Cilium (eBPF)                    |
+| ------------------- | -------------------------- | -------------------------------- |
+| Packet Path         | User-space rule processing | In-kernel bytecode               |
+| Connection Tracking | Netfilter conntrack table  | Cilium’s custom BPF maps         |
+| Load-Balancing      | Round robin only           | Random, Maglev, Affinity         |
+| Scalability         | Degrades >10k rules        | O(1) lookup, millions of entries |
+| Visibility          | Poor                       | Full flow tracing via Hubble     |
+| Overhead            | High (context switching)   | Low (kernel-level, event-driven) |
+
+---
+
+## ⚖️ 5. Summary
+
+✅ **Cilium replaces kube-proxy with eBPF-based load balancing**
+✅ **Service lookup and backend selection** done via BPF maps
+✅ **Default algorithm:** random hash
+✅ **Optional algorithm:** Maglev consistent hashing (stable backend mapping)
+✅ **Implemented at L4**, can integrate with L7 Envoy for advanced routing
+✅ **No iptables**, **no conntrack bottleneck**, **high scalability**
+
+---
