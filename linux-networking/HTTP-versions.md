@@ -237,3 +237,64 @@ Developed by Google and IETF to eliminate TCP’s latency and HOL blocking issue
 * **HTTP/3** → Independent self-driving lanes (UDP streams). One crash doesn’t stop others.
 
 ---
+
+# 🎯 **Flow Examples (Easy to Visualize)**
+
+## 🔵 **HTTP/1.1 Flow**
+
+```
+GET index.html  → wait ← OK
+GET style.css   → wait ← OK
+GET app.js      → wait ← OK
+```
+
+Slow & serialized.
+
+---
+
+## 🟢 **HTTP/2 Flow**
+
+```
+All requests sent together:
+GET index.html (stream 1)
+GET style.css  (stream 2)
+GET app.js     (stream 3)
+GET image1.jpg (stream 4)
+
+Response interleaved:
+<stream 1><stream 2>
+<stream 4><stream 1><stream 3>...
+```
+
+Fast, but all streams stall if TCP packet drops.
+
+---
+
+## 🟣 **HTTP/3 Flow**
+
+```
+Streams are independent:
+stream 1 packets → delayed
+stream 2 packets → arriving fine
+stream 3 packets → arriving fine
+stream 4 packets → arriving fine
+```
+
+No blocking.
+
+---
+
+# 📌 Real-World Performance Improvements
+
+### **HTTP/3 benefits most:**
+
+* Mobile networks
+* High packet-loss environments
+* Globally distributed traffic
+* Users with unstable WiFi
+* Streaming + real-time gaming
+
+Cloudflare, Google, Facebook, and YouTube already use HTTP/3 by default.
+
+---
+
